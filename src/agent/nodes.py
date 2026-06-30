@@ -1,26 +1,30 @@
 import json
 import logging
 import os
-from typing import Annotated, Any, Literal, Optional, TypedDict
+from typing import Literal, Optional
 
 import pandas as pd
 from dotenv import load_dotenv
-from langchain_core.messages import AnyMessage, HumanMessage
+from langchain_core.messages import HumanMessage
 from langchain_groq import ChatGroq
 from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint
-from langgraph.checkpoint.memory import MemorySaver
-from langgraph.graph import END, START, StateGraph, add_messages
 from langgraph.types import Command
 
 # MCP imports
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.types import AnyUrl
-from pydantic import BaseModel
 
+from agent.prompts import (
+    CLASSIFICATION_PROMPT,
+    EXPLANATION_PROMPT,
+    EXPLANATION_PROMPT_GAME,
+    MAPPING_PROMPT,
+)
+from agent.state import GameSpecification, SalesAgentState, UserRequestClassification
 from filter import filter_laptops
 from scoring import compute_scores, get_weights
-from sys_req_lookup_tool import (
+from tools.sys_req_lookup_tool import (
     GameNotFound,
     local_lookup,
 )
@@ -30,58 +34,6 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
-
-
-class LaptopSpecification(BaseModel):
-    model_name: Optional[str] = None
-    brand: Optional[str] = None
-    cpu: Optional[str] = None
-    cpu_cores: Optional[int] = None
-    cpu_threads: Optional[int] = None
-    ram: Optional[int] = None
-    ssd_gb: Optional[int] = None
-    hdd_gb: Optional[int] = None
-    os: Optional[str] = None
-    gpu: Optional[str] = None
-    gpu_vram_gb: Optional[float] = None
-    screen_size_in: Optional[float] = None
-    resolution_w: Optional[int] = None
-    resolution_h: Optional[int] = None
-    resolution_type: Optional[str] = None
-    sort_by_gpu_tier: Optional[bool] = False
-    price_euro: Optional[float] = None
-
-
-class GameSpecification(BaseModel):
-    ram: Optional[int] = None
-    gpu: Optional[str] = None
-
-
-class UserRequestClassification(BaseModel):
-    usage_profile: Literal["gaming", "student", "basic", "workstation"]
-    user_emphasis: Optional[
-        list[Literal["cpu_tier", "gpu_tier", "ram", "ssd_present", "price"]]
-    ] = None
-    filters: Optional[LaptopSpecification] = None
-    specific_game: Optional[str] = None
-    gibberish: Optional[bool] = False
-
-
-class SalesAgentState(TypedDict):
-    user_input: str
-
-    classification: dict[str, Any] | None
-
-    game_specific_filters: dict[str, Any] | None
-    game_system_requirements: dict[str, Any] | None
-
-    filtered_laptops: list[dict[str, Any]] | None
-
-    recommended_laptops: list[dict[str, Any]] | None
-
-    final_response: str | None
-
-    messages: Annotated[list[AnyMessage], add_messages]
 
 
 class SalesAgent:
@@ -141,10 +93,10 @@ class SalesAgent:
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 tools = await session.list_tools()
+
                 logger.info("Available MCP Tools:")
                 for tool in tools.tools:
                     logger.info(f"  - {tool.name}: {tool.description}")
-
                 result = await session.call_tool(
                     "online_lookup", arguments={"game_name": game_name}
                 )
@@ -172,21 +124,9 @@ class SalesAgent:
     ]:
         structured_llm = self.llm.with_structured_output(UserRequestClassification)
 
-        classification_prompt = f"""
-        Your are AI Laptop Sales Assistant.
-        Analyze this customer message and classify it:
-
-        User Message: {state["user_input"]}
-
-        Provide:
-        1. usage_profile: One of ["gaming", "student", "basic", "workstation"]
-        2. user_emphasis: List of emphasized features from ["cpu_tier", "gpu_tier", "ram", "ssd_present", "price"], or null
-        3. filters: Dictionary of specific requirements mentioned or null if none specified
-        4. specific_game: If the user mentions a specific game title, extract it. 
-        5. gibberish: set it to True, if user talking out of laptops context or random typing
-
-        Only include filters that are explicitly mentioned by the user.
-        """
+        classification_prompt = CLASSIFICATION_PROMPT.format(
+            user_input=state["user_input"]
+        )
 
         classification = structured_llm.invoke(classification_prompt)
 
@@ -226,22 +166,12 @@ class SalesAgent:
                 )
             structured_llm = self.llm.with_structured_output(GameSpecification)
 
-            mapping_prompt = f"""
-                Given the following recommended system requirements for the game {recc_game_requirements["game_name"]}:
+            mapping_prompt = MAPPING_PROMPT.format(
+                game_name=recc_game_requirements["game_name"],
+                gpu=recc_game_requirements["gpu"],
+                cpu=recc_game_requirements["cpu"],
+            )
 
-                GPU: {recc_game_requirements["gpu"]}
-                RAM: {recc_game_requirements["ram"]}
-                
-                Our dataset includes:
-                GPUs: GTX 1650, RTX 2050, RTX 3050, RTX 3050 Ti, RTX 3060, RTX 3070, RTX 3070 Ti, RTX 3080, RTX 3080 Ti
-
-                Extract and map these requirements to the following laptop specification format:
-                - Only extract Nvidia (RTX/GTX) GPUs. If the requirement is worse than out minimum GPU (GTX 1650 in this case), set the value to GTX 1650.
-                - For RTX and GTX GPUs, use the format: RTX 3060, GTX 1660, etc.
-                - If the game needs specific hardware not in our dataset, choose the closest possible match for example (RTX 2070 -> RTX 3050)
-                - If the game requires hardware worse than our minimum spec laptops, set the value to our minimum spec hardware (GTX 1650).
-
-            """
             game_specific_filters = structured_llm.invoke(mapping_prompt)
             return Command(
                 update={
@@ -327,33 +257,19 @@ class SalesAgent:
         game_requirements = state.get("game_system_requirements", {})
 
         if isinstance(game_requirements, dict) and game_requirements.get("game_name"):
-            explanation_prompt = f"""
-            The following laptops have been recommended based on the user's need to play on reccomanded settings this game: {game_requirements["game_name"]}
-
-            {reccomended_laptops}
-
-            Please provide a detailed explanation of why these laptops are suitable for the user.
-
-            Here is the context about the user:
-            {user_context}
-
-            Here is the context about the game  recommended system requirements:
-            GPU: {game_requirements["gpu"]}\n
-            CPU: {game_requirements["cpu"]}\n
-            RAM: {game_requirements["ram"]}\n
-
-            """
+            explanation_prompt = EXPLANATION_PROMPT_GAME.format(
+                game_name=game_requirements["game_name"],
+                reccomended_laptops=reccomended_laptops,
+                user_context=user_context,
+                gpu=game_requirements["gpu"],
+                cpu=game_requirements["cpu"],
+                ram=game_requirements["ram"],
+            )
         else:
-            explanation_prompt = f"""
-            The following laptops have been recommended based on the user's needs:
-
-            {reccomended_laptops}
-
-            Please provide a detailed explanation of why these laptops are suitable for the user.
-
-            Here is the context about the user:
-            {user_context}
-            """
+            explanation_prompt = EXPLANATION_PROMPT.format(
+                reccomended_laptops=reccomended_laptops,
+                user_context=user_context,
+            )
 
         explanation = self.llm.invoke(explanation_prompt)
 
@@ -363,7 +279,7 @@ class SalesAgent:
         )
 
     @staticmethod
-    def inform_user_no_laptops(state: SalesAgentState) -> dict:
+    def inform_user_no_laptops(_state: SalesAgentState) -> dict:
         return {
             "final_response": (
                 "Unfortunately, no laptops match your specified criteria in our database."
@@ -372,7 +288,7 @@ class SalesAgent:
         }
 
     @staticmethod
-    def inform_user_gibberish(state: SalesAgentState) -> dict:
+    def inform_user_gibberish(_state: SalesAgentState) -> dict:
         return {
             "final_response": (
                 "Unfortunately, we did not understand your request. Please stay on topic of laptops."
@@ -388,29 +304,3 @@ class SalesAgent:
         print(state["final_response"])
         print("=" * 80 + "\n")
         return {}
-
-
-async def build_graph(provider: str = "groq"):
-    agent = SalesAgent(provider)
-    await agent.get_mcp_paths()
-
-    workflow = StateGraph(SalesAgentState)
-    workflow.add_node("read_user_prompt", agent.read_user_prompt)
-    workflow.add_node("classify_intent", agent.classify_intent)
-    workflow.add_node("get_game_requirements", agent.get_game_requirements)
-    workflow.add_node("get_filtered_laptops", agent.get_filtered_laptops)
-    workflow.add_node("get_recommended_laptops", agent.get_recommended_laptops)
-    workflow.add_node("explain_reccomandations", agent.explain_reccomandations)
-    workflow.add_node("inform_user_no_laptops", agent.inform_user_no_laptops)
-    workflow.add_node("inform_user_gibberish", agent.inform_user_gibberish)
-    workflow.add_node("send_reply", agent.send_reply)
-    workflow.add_edge(START, "read_user_prompt")
-    workflow.add_edge("read_user_prompt", "classify_intent")
-    workflow.add_edge("inform_user_no_laptops", "send_reply")
-    workflow.add_edge("inform_user_gibberish", "send_reply")
-    workflow.add_edge("send_reply", END)
-
-    memory = MemorySaver()
-
-    graph = workflow.compile(checkpointer=memory)
-    return graph

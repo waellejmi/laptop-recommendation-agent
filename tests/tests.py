@@ -1,7 +1,7 @@
 import asyncio
 from time import sleep
 
-from agent import build_graph
+from src.agent.graph import build_graph
 
 
 async def test_agent(user_input: str):
