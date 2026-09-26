@@ -1,4 +1,4 @@
-# Laptop Sales Agent
+# Laptop Recommendation Agent
 
 As the computer guy of the family, everyone who is buying a laptop ends up calling me and asking which brand or model to get. That is fair. Laptops are genuinely confusing for non-technical people, and specs alone do not explain whether a device actually fits someone’s needs.
 
